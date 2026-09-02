@@ -644,7 +644,7 @@ def using_forge_operations(operations=None, device=None, dtype=None, manual_cast
         # https://github.com/Comfy-Org/ComfyUI/blob/v0.16.4/comfy/ops.py#L950
 
         _device = memory_management.get_torch_device()
-        _dtype = torch.bfloat16 if memory_management.should_use_bf16(_device) else torch.float32
+        _dtype = torch.bfloat16 if memory_management.should_use_bf16(_device) else torch.float16  # [0902] fp32->fp16: Turing 无 bf16, fp32 算力减半; ComfyUI 同卡 fp16=1.22 it/s
         fp8_compute = memory_management.supports_fp8_compute(_device)
         nvfp4_compute = memory_management.supports_nvfp4_compute(_device)
         mxfp8_compute = memory_management.supports_mxfp8_compute(_device)

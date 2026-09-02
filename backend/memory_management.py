@@ -596,7 +596,10 @@ def free_memory(memory_required: float, device: torch.device, keep_loaded: list[
         memory_to_free = None
         if not DISABLE_SMART_MEMORY:
             free_mem = get_free_memory(device)
-            if free_mem > memory_required:
+            # [Forge local patch 2026-09-02] 边界 `>` -> `>=`：free 恰好等于需求
+            # 时不卸载（DiT 全驻 7.3G 后 VAE 加载边界共存，避免每张图 VAE 把
+            # DiT 挤掉 3.9G 再重载的搬运开销）。
+            if free_mem >= memory_required:
                 break
             memory_to_free = memory_required - free_mem
         logger.debug(f"Unloading {current_loaded_models[i].model.model.__class__.__name__}")
@@ -616,9 +619,13 @@ def free_memory(memory_required: float, device: torch.device, keep_loaded: list[
     return unloaded_models
 
 
-def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, force_patch_weights: bool = False, minimum_memory_required: float = None, force_full_load: bool = False):
+def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, force_patch_weights: bool = False, minimum_memory_required: float = None, force_full_load: bool = False, keep_all_existing: bool = False):
+    """keep_all_existing: [0902 小号 aimdo] 加载新模型时, free_memory 保留所有已驻留模型不卸载
+    (等价 ComfyUI 对 dynamic 模型 for_dynamic 分支的"互不卸载")。
+    用于 VAE decode 场景: VAE 仅 0.24G, 加载它不应逐出 DiT 8.19G。"""
     execution_start_time = time.perf_counter()
     cleanup_models_gc(target=models)
+    keep_existing = list(current_loaded_models) if keep_all_existing else []
 
     inference_memory = minimum_inference_memory()
     extra_mem = max(inference_memory, memory_required + extra_reserved_memory())
@@ -669,13 +676,13 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
 
     for device in total_memory_required:
         if device != torch.device("cpu"):
-            free_memory(total_memory_required[device] * 1.1 + extra_mem, device)
+            free_memory(total_memory_required[device] * 1.1 + extra_mem, device, keep_loaded=keep_existing)
 
     for device in total_memory_required:
         if device != torch.device("cpu"):
             free_mem = get_free_memory(device)
             if free_mem < minimum_memory_required:
-                models_l = free_memory(minimum_memory_required, device)
+                models_l = free_memory(minimum_memory_required, device, keep_loaded=keep_existing)
                 logger.debug("{} models unloaded.".format(len(models_l)))
 
     for loaded_model in models_to_load:
@@ -687,14 +694,22 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
             vram_set_state = vram_state
         lowvram_model_memory = 0
         if lowvram_available and vram_set_state in (VRAMState.LOW_VRAM, VRAMState.NORMAL_VRAM) and not force_full_load:
-            loaded_memory = loaded_model.model_loaded_memory()
-            current_free_mem = get_free_memory(torch_dev) + loaded_memory
+            # [Forge local patch 2026-09-02] KModel（Krea2/Anima int4/int8 量化 DiT）
+            # 强制全量加载：物理 ~7.3G + 激活 ~2.7G < 11G 完全装得下。走 lowvram
+            # 预算会让 DiT "loaded partially"（一半权重留 CPU），采样时每层动态
+            # 搬运 -> 0.75 it/s（全驻 + 量化内核 = 1.22 it/s，与 ComfyUI 持平）。
+            _inner = getattr(model, "model", None)
+            if _inner is not None and _inner.__class__.__name__ == "KModel":
+                lowvram_model_memory = 1e32
+            else:
+                loaded_memory = loaded_model.model_loaded_memory()
+                current_free_mem = get_free_memory(torch_dev) + loaded_memory
 
-            lowvram_model_memory = max(0, (current_free_mem - minimum_memory_required), min(current_free_mem * MIN_WEIGHT_MEMORY_RATIO, current_free_mem - minimum_inference_memory()))
-            lowvram_model_memory = lowvram_model_memory - loaded_memory
+                lowvram_model_memory = max(0, (current_free_mem - minimum_memory_required), min(current_free_mem * MIN_WEIGHT_MEMORY_RATIO, current_free_mem - minimum_inference_memory()))
+                lowvram_model_memory = lowvram_model_memory - loaded_memory
 
-            if lowvram_model_memory == 0:
-                lowvram_model_memory = 0.1
+                if lowvram_model_memory == 0:
+                    lowvram_model_memory = 0.1
 
         if vram_set_state is VRAMState.NO_VRAM:
             lowvram_model_memory = 0.1

@@ -133,7 +133,7 @@ class VAE:
             self.latent_dim = 2
             self.latent_channels = 32 if is_mugen else int(model.config.latent_channels)  # 4 | 16
             self.memory_used_encode = lambda shape, dtype: (1767 * shape[2] * shape[3]) * memory_management.dtype_size(dtype)
-            self.memory_used_decode = lambda shape, dtype: (2178 * shape[2] * shape[3] * 64) * memory_management.dtype_size(dtype)
+            self.memory_used_decode = lambda shape, dtype: (2178 * shape[2] * shape[3] * 8) * memory_management.dtype_size(dtype)  # [0902] 64->8: 估算贴近真实峰值, 避免 decode 时过度卸载 DiT
 
             if is_flux2:
                 self.upscale_ratio = 16
@@ -208,7 +208,7 @@ class VAE:
 
         try:
             memory_used = self.memory_used_decode(samples_in.shape, self.vae_dtype)
-            memory_management.load_models_gpu([self.patcher], memory_required=memory_used)
+            memory_management.load_models_gpu([self.patcher], memory_required=memory_used, keep_all_existing=True)  # [0902 mini-aimdo] VAE 0.24G -> 保留 DiT 不卸
             free_memory = memory_management.get_free_memory(self.device)
             batch_number = int(free_memory / memory_used)
             batch_number = max(1, batch_number)
@@ -234,7 +234,7 @@ class VAE:
 
     def decode_tiled(self, samples: torch.Tensor, tile_x: int = 64, tile_y: int = 64, overlap: int = 16):
         memory_used = self.memory_used_decode(samples.shape, self.vae_dtype)
-        memory_management.load_models_gpu([self.patcher], memory_required=memory_used)
+        memory_management.load_models_gpu([self.patcher], memory_required=memory_used, keep_all_existing=True)  # [0902 mini-aimdo] VAE 0.24G -> 保留 DiT 不卸
 
         args = {
             "tile_x": tile_x,

@@ -451,7 +451,13 @@ class ModelPatcher:
         inplace_update = self.weight_inplace_update or inplace_update
 
         if key not in self.backup and not return_weight:
-            self.backup[key] = collections.namedtuple("Dimension", ["weight", "inplace_update"])(weight.to(device=self.offload_device, copy=inplace_update), inplace_update)
+            # [Forge local patch 0902-A] A1111 风格：LoRA 原始权重备份强制放 CPU 内存，而非显存。
+            # 原逻辑用 self.offload_device，HIGH_VRAM 下它 = cuda:0，导致每个被 patch 的层在
+            # 显卡上多存一份原始权重（Anima+LoRA 实测 ~1140MB 显存白占）。
+            # restore 链（unpatch_model / partially_unload）都带 self.model.to(device_to) 或
+            # 走 copy_to_param（param.data.copy_() 跨设备安全），备份放 CPU 后恢复时自动搬回 GPU。
+            _lora_backup_device = torch.device("cpu")
+            self.backup[key] = collections.namedtuple("Dimension", ["weight", "inplace_update"])(weight.to(device=_lora_backup_device, copy=inplace_update), inplace_update)
 
         temp_dtype = memory_management.lora_compute_dtype(device_to) if key in self.patches else None
         if device_to is not None:
@@ -603,6 +609,14 @@ class ModelPatcher:
 
             for param in params.keys():
                 key = key_param_name_to_key(n, param)
+                # [Forge local patch 0902-B] INT8 自定义层（INT8Linear 等, int8_fast_forge 扩展）：
+                # 不用 patch_weight_to_device（会 backup/temp 多占显存）。weight 有 LoRA 时挂
+                # weight_function 即时合并，无 LoRA 时跳过（连 getter 都不调）；bias 仍走原路径
+                #（INT8 forward 不读 bias_function，bias 小、烤入安全）。
+                if getattr(m, "forge_int8_layer", False) and param == "weight":
+                    if key in self.patches:
+                        m.weight_function = [LowVramPatch(key, self.patches)]
+                    continue  # INT8 weight: 有 LoRA 挂 weight_function, 无则跳过; 不走 patch_weight_to_device
                 self.unpin_weight(key)
                 self.patch_weight_to_device(key, device_to=device_to)
 
